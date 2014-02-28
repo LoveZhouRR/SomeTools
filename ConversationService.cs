@@ -19,12 +19,14 @@ using DBC.WeChat.Models.Conversation;
 using DBC.WeChat.Models.Conversation.Msg;
 using DBC.WeChat.Models.Infrastructures;
 using DBC.WeChat.Models.Sales;
+using DBC.WeChat.Services.Components.Files;
 using DBC.WeChat.Services.Components.Picture;
 using DBC.WeChat.Services.Components.XMLSerialization;
 using DBC.WeChat.Services.Conversation.Models;
 using DBC.WeChat.Services.Logging;
 using Res = DBC.WeChat.Services.Properties.Resources;
 using Newtonsoft.Json;
+using Picture = DBC.WeChat.Models.Conversation.Msg.Picture;
 using Product = DBC.WeChat.Models.Sales.Product;
 using ProductQuery = DBC.WeChat.Models.Sales.ProductQuery;
 using ProductTagQuery = DBC.WeChat.Models.Sales.ProductTagQuery;
@@ -33,17 +35,45 @@ namespace DBC.WeChat.Services.Conversation.Components
 {
     public class ConversationService : IConversationService
     {
+        /// <summary>
+        /// 日志
+        /// </summary>
         public ILogger Logger { get; set; }
         public IModelService ModelService { get; set; }
+        /// <summary>
+        /// 创建标准化的自定义菜单
+        /// </summary>
         public WechatMenu DefaultMenu { get; set; }
+        /// <summary>
+        /// 关键词商品回复需要
+        /// </summary>
         public string ProductUrl { get; set; }
+        /// <summary>
+        /// 关键词商品回复需要
+        /// </summary>
         public string Ftp { get; set; }
         public PictureSize CoverSize { get; set; }
         public PictureSize ItemSize { get; set; }
+        /// <summary>
+        /// 是否记录用户对话信息
+        /// </summary>
         public bool HasDialogs { get; set; }
+        /// <summary>
+        /// 生成场景二维码时需要
+        /// </summary>
         public IPictureService PictureService { get; set; }
+        /// <summary>
+        /// 该属性在媒体上传接口中需要
+        /// </summary>
+        public HttpUpload UploadCompenent { get; set; }
 
         #region 接口方法
+        /// <summary>
+        /// 消息回复
+        /// </summary>
+        /// <param name="postStr">微信消息字符串包含用户信息</param>
+        /// <param name="ownerID"></param>
+        /// <returns></returns>
         public string GetResponse(string postStr, long ownerID)
         {
             string responsetext = "";
@@ -54,6 +84,8 @@ namespace DBC.WeChat.Services.Conversation.Components
             {
                 case "text":
                     TextRequest msg = (TextRequest)SerializationHelper.DeSerialize(typeof(TextRequest), postStr);
+                    if (!CheckReSendMsg(msg, ownerID))
+                        break;
                     if (HasDialogs)
                     {
                         ModelService.Create(new Dialogue()
@@ -61,13 +93,27 @@ namespace DBC.WeChat.Services.Conversation.Components
                             FromUserName = msg.FromUserName,
                             Content = msg.Content,
                             ToUserName = msg.ToUserName,
-                            OwnerID = ownerID
+                            OwnerID = ownerID,
+                            CheckSign = msg.FromUserName+msg.CreateTime,
                         });
                     }
+                    SendKeyResponse(msg, ownerID);
                     responsetext = GetProductResponse(msg, ownerID);
                     break;
                 case "event":
                     RequestEvent requestEvent = (RequestEvent)SerializationHelper.DeSerialize(typeof(RequestEvent), postStr);
+                    if (!CheckReSendMsg(requestEvent, ownerID))
+                        break;
+                    if (HasDialogs)
+                    {
+                        ModelService.Create(new Dialogue()
+                        {
+                            FromUserName = requestEvent.FromUserName,
+                            ToUserName = requestEvent.ToUserName,
+                            OwnerID = ownerID,
+                            CheckSign = requestEvent.FromUserName + requestEvent.CreateTime,
+                        });
+                    }
                     responsetext = GetEventResponse(requestEvent, ownerID, postStr);
                     break;
                 default:
@@ -76,6 +122,12 @@ namespace DBC.WeChat.Services.Conversation.Components
             return responsetext;
         }
 
+        /// <summary>
+        /// 创建标准自定义菜单
+        /// </summary>
+        /// <param name="account"></param>
+        /// <param name="menuStr">默认为DefaultMenu,可以直接输入json字符串</param>
+        /// <returns></returns>
         public bool CreateMenu(WeChatAccount account, string menuStr = "")
         {
             if (menuStr == "")
@@ -86,9 +138,45 @@ namespace DBC.WeChat.Services.Conversation.Components
                 if (store == null)
                     return false;
                 menuStr = MakeMenu(store.Code, account.AppID);
+                //坑爹的一次演示
+                if (account.AppID == "wxb6dcbbbc51b694cb")
+                {
+                    
+                    menuStr = @"{
+                     'button':[
+                        {
+                        'name':'关于我们',
+                        'type':'view',
+                        'url':'https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx164a5bf915aa6725&redirect_uri=http://dbcec.com/Mall/7EU9/home/companyintro&response_type=code&scope=snsapi_base&state=1&from=message&isappinstalled=0#wechat_redirect'
+                        },
+                      {
+                           'name':'互动活动',
+                           'sub_button':[
+                           {	
+                               'type':'view',
+                               'name':'刮刮卡',
+                               'url':'https://open.weixin.qq.com/connect/oauth2/authorize?appid=wxb6dcbbbc51b694cb&redirect_uri=http://dbcec.com/Mall/7EU9/Activity/ScratchCard&response_type=code&scope=snsapi_base&state=1&from=message&isappinstalled=0#wechat_redirect'
+                            }
+                            ]
+                       },
+                       {
+                           'name':'服务中心',
+                           'sub_button':[
+                           {	
+                               'type':'view',
+                               'name':'中奖历史',
+                               'url':'https://open.weixin.qq.com/connect/oauth2/authorize?appid=wxb6dcbbbc51b694cb&redirect_uri=http://dbcec.com/Mall/7EU9/Activity/AwardHistory&response_type=code&scope=snsapi_base&state=1&from=message&isappinstalled=0#wechat_redirect'
+                            }
+                            ]
+                       }
+                       ]
+                 }";
+                    menuStr = menuStr.Replace("'", "\"");
+                }
             }
             try
             {
+                this.Logger.SafeLog(menuStr, Level.Info);
                 string RequestUrl = string.Format(Res.MenuCreateURL, GetToken(account));
                 HttpWebRequest Request = WebRequest.Create(RequestUrl) as HttpWebRequest;
                 byte[] bs = Encoding.UTF8.GetBytes(menuStr);
@@ -100,15 +188,15 @@ namespace DBC.WeChat.Services.Conversation.Components
                     reqStream.Write(bs, 0, bs.Length);
                     reqStream.Close();
                 }
-                // Logger.SafeLog(RequestUrl, Level.Info);
+                Logger.SafeLog(RequestUrl, Level.Info);
                 WebResponse Response = Request.GetResponse();
                 using (Stream outstream = Response.GetResponseStream())
                 {
                     byte[] data = new byte[Response.ContentLength];
                     outstream.Read(data, 0, (int)Response.ContentLength);
                     var obj = (EventResponse)JsonConvert.DeserializeObject(Encoding.UTF8.GetString(data), typeof(EventResponse));
-                    //Logger.SafeLog(data, Level.Info);
-                    return obj.errcode == "0";
+                    Logger.SafeLog(Encoding.UTF8.GetString(data), Level.Info);
+                    return obj.Errcode == "0";
                 }
 
             }
@@ -120,6 +208,11 @@ namespace DBC.WeChat.Services.Conversation.Components
 
         }
 
+        /// <summary>
+        /// 删除自定义菜单
+        /// </summary>
+        /// <param name="account"></param>
+        /// <returns></returns>
         public bool DeleteMenu(WeChatAccount account)
         {
             try
@@ -135,7 +228,7 @@ namespace DBC.WeChat.Services.Conversation.Components
                     outstream.Read(data, 0, (int)Response.ContentLength);
                     var obj = (EventResponse)JsonConvert.DeserializeObject(Encoding.UTF8.GetString(data), typeof(EventResponse));
                     //Logger.SafeLog(data, Level.Info);
-                    return obj.errcode == "0";
+                    return obj.Errcode == "0";
                 }
             }
             catch (Exception e)
@@ -145,6 +238,13 @@ namespace DBC.WeChat.Services.Conversation.Components
             }
         }
 
+
+        /// <summary>
+        /// 请求用户openid
+        /// </summary>
+        /// <param name="code">微信授权验证接口返回的参数，详情查询微信接口说明</param>
+        /// <param name="ownerID"></param>
+        /// <returns></returns>
         public string RequestOpenID(string code, long ownerID)
         {
             try
@@ -162,13 +262,13 @@ namespace DBC.WeChat.Services.Conversation.Components
                     byte[] data = new byte[Response.ContentLength];
                     outstream.Read(data, 0, (int)Response.ContentLength);
                     var obj = (OpenIDResponse)JsonConvert.DeserializeObject(Encoding.UTF8.GetString(data), typeof(OpenIDResponse));
-                    if (obj.access_token == null)
+                    if (obj.AccessToken == null)
                     {
                         var error = (EventResponse)JsonConvert.DeserializeObject(Encoding.UTF8.GetString(data), typeof(EventResponse));
                         Logger.SafeLog(Encoding.UTF8.GetString(data), Level.Error);
                         return null;
                     }
-                    return obj.openid;
+                    return obj.Openid;
                 }
             }
             catch (Exception e)
@@ -178,6 +278,12 @@ namespace DBC.WeChat.Services.Conversation.Components
             }
         }
 
+        /// <summary>
+        /// 请求用户个人信息
+        /// </summary>
+        /// <param name="ownerID"></param>
+        /// <param name="openid"></param>
+        /// <returns></returns>
         public UserInfo RequeUserInfo(long ownerID, string openid)
         {
             var account = ModelService.SelectOrEmpty(new WeChatAccountQuery() { OwnerID = ownerID }).FirstOrDefault();
@@ -203,6 +309,11 @@ namespace DBC.WeChat.Services.Conversation.Components
             }
         }
 
+        /// <summary>
+        /// 请求场景二维码
+        /// </summary>
+        /// <param name="ownerID"></param>
+        /// <returns></returns>
         public Scene RequestPermanentScene(long ownerID)
         {
             Scene scene = new Scene()
@@ -247,12 +358,12 @@ namespace DBC.WeChat.Services.Conversation.Components
             {
                 var result = reader.ReadToEnd();
                 var ticket = (TicketResponse)JsonConvert.DeserializeObject(result, typeof(TicketResponse));
-                if (ticket.ticket == null)
+                if (ticket.Ticket == null)
                 {
                     Logger.SafeLog(result, Level.Error);
                     return null;
                 }
-                scene.Ticket = ticket.ticket;
+                scene.Ticket = ticket.Ticket;
                 scene.WechatSceneID = sceneCount.Count;
             }
             ModelService.Create(scene);
@@ -260,10 +371,75 @@ namespace DBC.WeChat.Services.Conversation.Components
             return scene;
         }
 
+        /// <summary>
+        /// 多媒体上传
+        /// </summary>
+        /// <param name="account"></param>
+        /// <param name="resource"></param>
+        /// <returns></returns>
+        public string UploadMedia(WeChatAccount account, FileResource resource)
+        {
+            string type = "";
+            switch (resource.Type)
+            {
+                case ResourceType.Picture:
+                    type = "image";
+                    break;
+                case ResourceType.Audio:
+                    type = "voice";
+                    break;
+                case ResourceType.Video:
+                    type = "video";
+                    break;
+            }
+            string token = GetToken(account);
+            string url = string.Format(Res.UploadMediaURL, token, type);
+            var response = UploadCompenent.PostMultipleFiles(url, new[] { System.IO.Path.Combine(resource.Path, resource.Name) });
+            var obj = (MediaResponse)JsonConvert.DeserializeObject(response, typeof(MediaResponse));
+            if (obj.MediaId != null)
+            {
+                return obj.MediaId;
+            }
+            else
+            {
+                var error = (EventResponse)JsonConvert.DeserializeObject(response, typeof(EventResponse));
+                Logger.SafeLog(error, Level.Error);
+                return "";
+            }
+        }
+
 
         #endregion
 
         #region 私有方法
+
+        /// <summary>
+        /// 无重复返回true
+        /// </summary>
+        /// <param name="msg"></param>
+        /// <param name="ownerID"></param>
+        /// <returns></returns>
+        public bool CheckReSendMsg(BaseWeChatMSG msg, long ownerID)
+        {
+            var dialog = ModelService.Select(new DialogueQuery()
+            {
+                CheckSign = msg.FromUserName + msg.CreateTime,
+                OwnerID = ownerID,
+            }).FirstOrDefault();
+            return dialog == null;
+        }
+
+        public bool CheckReSendMsg(MediaResponse msg, long ownerID)
+        {
+            var dialog = ModelService.Select(new DialogueQuery()
+            {
+                CheckSign = msg.MediaId,
+                OwnerID = ownerID,
+            }).FirstOrDefault();
+            return dialog == null;
+        }
+
+
         public void GetScenePic(Scene scene)
         {
             try
@@ -303,8 +479,8 @@ namespace DBC.WeChat.Services.Conversation.Components
                     AccessToken newToken = new AccessToken()
                     {
                         OwnerID = account.OwnerID,
-                        Token = response.access_token,
-                        ExpiresIn = response.expires_in - 50,
+                        Token = response.AccessToken,
+                        ExpiresIn = response.ExpiresIn - 50,
                         LastGetAt = DateTime.Now,
                     };
                     ModelService.Create(newToken);
@@ -317,8 +493,8 @@ namespace DBC.WeChat.Services.Conversation.Components
                     (accessToken.LastGetAt == null || accessToken.LastGetAt.Value.AddSeconds(accessToken.ExpiresIn ?? 7150) < DateTime.Now))
                 {
                     var response = RequestToken(account);
-                    accessToken.Token = response.access_token;
-                    accessToken.ExpiresIn = response.expires_in - 50;
+                    accessToken.Token = response.AccessToken;
+                    accessToken.ExpiresIn = response.ExpiresIn - 50;
                     accessToken.LastGetAt = DateTime.Now;
                     ModelService.Update(accessToken);
                 }
@@ -341,7 +517,7 @@ namespace DBC.WeChat.Services.Conversation.Components
                 {
                     var result = reader.ReadToEnd();
                     TokenResponse obj = (TokenResponse)JsonConvert.DeserializeObject(result, typeof(TokenResponse));
-                    if (obj.access_token == null)
+                    if (obj.AccessToken == null)
                     {
                         Logger.SafeLog(result, Level.Error);
                         return null;
@@ -435,41 +611,192 @@ namespace DBC.WeChat.Services.Conversation.Components
             return responsetext;
         }
 
-        public string GetKeyResponse(TextRequest msg, long ownerID)
+        public void SendKeyResponse(TextRequest msg, long ownerID)
         {
-            string responsetext = "";
             //检索关键字
             var key = ModelService.Select(new KeyWordQuery() { Content = msg.Content, OwnerID = ownerID }).FirstOrDefault();
-            long? ruleID = 0;
-            if (key == null || key.KeyWordGroupID == null)
+            var rulequery = new RuleQuery() { OwnerID = ownerID };
+            if (key == null || key.RuleID == null)
             {
-                var rule = ModelService.Select(new KeyWordGroupQuery() { OwnerID = ownerID, Type = (int)RuleType.Default }).FirstOrDefault();
-                if (rule != null)
-                    ruleID = rule.ID;
+                rulequery.Type = (int)RuleType.Default;
             }
             else
             {
-                ruleID = key.KeyWordGroupID;
+                rulequery.IDs = new long[] { key.RuleID.Value };
             }
-            //随即回复
-            var reply = ModelService.Select(new ReplyQuery() { KeyWordGroupID = ruleID }).FirstOrDefault();
-            if (reply != null)
+
+            var rule = ModelService.SelectOrEmpty(rulequery).FirstOrDefault();
+            if (rule == null)
+                return;
+            var replyquery = new ReplyQuery() { RuleID = rule.ID };
+            var reply = ModelService.Select(replyquery).FirstOrDefault();
+            if (reply == null)
+                return;
+            var account = ModelService.Select(new WeChatAccountQuery() { OwnerID = ownerID }).FirstOrDefault();
+            string token = GetToken(account);
+            //全部回复
+            if (reply.ReplyAll != null && reply.ReplyAll.Value)
             {
-                switch (reply.Type)
+                replyquery.Includes = new[] { "TextReplyItems", "ResourceItems" };
+                reply = ModelService.Select(replyquery).FirstOrDefault();
+
+                foreach (var item in reply.TextReplyItems)
                 {
-                    case (int)ReplyType.news:
-                        break;
-                    case (int)ReplyType.text:
-                        var textReplys =
-                            ModelService.Select(new TextReplyItemQuery() { OwnerID = ownerID, ParentID = reply.ID }).ToArray();
-                        Random random = new Random();
-                        var index = random.Next(0, textReplys.Count() - 1);
-                        var textReply = textReplys[index];
-                        responsetext = MakeTextResponse(textReply, msg.FromUserName, msg.ToUserName);
-                        break;
+                    var textMsg = MakeJosnMsg(item, msg.FromUserName);
+                    CustomerServiceResponse(token, textMsg);
+                }
+                foreach (var item in reply.ResourceItems)
+                {
+                    var resourceMsg = MakeJosnMsg(item, msg.FromUserName);
+                    CustomerServiceResponse(token, resourceMsg);
                 }
             }
-            return responsetext;
+            //随机回复
+            else
+            {
+                CustomerServiceResponse(token, MakeRandomResponse(reply, msg.FromUserName));
+            }
+        }
+
+
+        private ResponseMSG MakeRandomResponse(Reply reply, string toUser)
+        {
+            var textquery = new TextReplyItemQuery()
+            {
+                OwnerID = reply.OwnerID,
+                ParentID = reply.ID,
+                Take = 0,
+                Skip = 0,
+            };
+            ModelService.Select(textquery);
+            var textreplycount = textquery.Count ?? 0;
+            var resourcequery = new ReplyResourceItemQuery()
+            {
+                OwnerID = reply.OwnerID,
+                ReplyID = reply.ID,
+                Take = 0,
+                Skip = 0,
+            };
+            var resourcecount = resourcequery.Count ?? 0;
+            var random = new Random();
+            var index = random.Next(0, (int)(textreplycount + resourcecount+1));
+            if (index < textreplycount)
+            {
+                textquery.Take = 1;
+                textquery.Skip = index;
+                var textreply = ModelService.Select(textquery).FirstOrDefault();
+                return MakeJosnMsg(textreply, toUser);
+            }
+            else
+            {
+                resourcequery.Take = 1;
+                resourcequery.Skip = index - textreplycount - 1;
+                var resourcereply = ModelService.Select(resourcequery).FirstOrDefault();
+                return MakeJosnMsg(resourcereply, toUser);
+            }
+        }
+
+        private ResponseMSG MakeJosnMsg(TextReplyItem item, string toUser)
+        {
+            var response = new JsonTextResponse()
+            {
+                ToUserName = toUser,
+                MsgType = "text",
+                Text = new Text()
+                {
+                    Content = item.Content
+                }
+            };
+            return response;
+
+        }
+
+        private ResponseMSG MakeJosnMsg(ReplyResourceItem item, string toUser)
+        {
+            switch (item.ResourceType)
+            {
+                case (int)ResourceType.Picture:
+                    var pic = ModelService.Select(new PictureResourceQuery()
+                    {
+                        OwnerID = item.OwnerID,
+                        IDs = new long[] { item.ResourceID.Value },
+                    }).FirstOrDefault();
+                    return new JsonImageResponse()
+                    {
+                        ToUserName = toUser,
+                        MsgType = "image",
+                        Picture = new Picture() { MediaID = pic.MediaId }
+                    };
+                case (int)ResourceType.Audio:
+                    var audio = ModelService.Select(new AudioResourceQuery()
+                   {
+                       OwnerID = item.OwnerID,
+                       IDs = new long[] { item.ResourceID.Value },
+                   }).FirstOrDefault();
+                    return new JsonVoiceResponse()
+                    {
+                        ToUserName = toUser,
+                        MsgType = "voice",
+                        Voice = new Voice() { MediaID = audio.MediaId }
+                    };
+                case (int)ResourceType.Video:
+                    var video = ModelService.Select(new VideoResourceQuery()
+                   {
+                       OwnerID = item.OwnerID,
+                       IDs = new long[] { item.ResourceID.Value },
+                   }).FirstOrDefault();
+                    return new JsonVideoResponse()
+                    {
+                        ToUserName = toUser,
+                        MsgType = "video",
+                        Video = new Video()
+                        {
+                            MediaID = video.MediaId,
+                            Description = video.Description,
+                            Title = video.Title
+                        }
+                    };
+                case (int)ResourceType.News:
+                    var cover = ModelService.Select(new NewsResourceQuery()
+                    {
+                        OwnerID = item.OwnerID,
+                        IDs = new long[] {item.ResourceID.Value}
+                    }).FirstOrDefault();
+                    var articles = new List<Article>();
+                    articles.Add(new Article()
+                    {
+                        Description = cover.Description,
+                        PicUrl = cover.PicUrl,
+                        Title = cover.Title,
+                        Url = cover.Title,
+                    });
+                    if (!cover.Single.Value)
+                    {
+                        var items = ModelService.Select(new NewsResourceQuery()
+                        {
+                            OwnerID = item.OwnerID,
+                            ParentID = item.ResourceID,
+                        });
+                        articles.AddRange(items.Select(o => new Article()
+                        {
+                            Description = o.Description,
+                            PicUrl = o.PicUrl,
+                            Title = o.Title,
+                            Url = o.Title,
+                        }));
+                    }
+                    return new JsonNewsResponse()
+                    {
+                        ToUserName = toUser,
+                        MsgType = "news",
+                        News = new News()
+                        {
+                            Articles = articles
+                        }
+                    };
+                default:
+                    return new ResponseMSG();
+            }
         }
 
         private string GetEventResponse(RequestEvent msg, long ownerID, string postStr)
@@ -531,7 +858,7 @@ namespace DBC.WeChat.Services.Conversation.Components
             return response;
         }
 
-        private string GetClickResponse(MenuEvent menuEvent,long ownerid)
+        private string GetClickResponse(MenuEvent menuEvent, long ownerid)
         {
             var response = "";
             switch (menuEvent.EventKey)
@@ -543,7 +870,7 @@ namespace DBC.WeChat.Services.Conversation.Components
                         FromUserName = menuEvent.FromUserName,
                         ToUserName = menuEvent.ToUserName,
                     };
-                    response=GetProductResponse(text, ownerid);
+                    response = GetProductResponse(text, ownerid);
                     if (response == "")
                     {
                         var defaultResponse = new TextReplyItem()
@@ -577,7 +904,7 @@ namespace DBC.WeChat.Services.Conversation.Components
             {
                 OwnerID = ownerID,
                 IDs = productScene.Select(o => o.ProductID).OfType<long>().ToArray(),
-                Includes = new []{"ProductPictures"}
+                Includes = new[] { "ProductPictures" }
             });
             response = MakeProductResponse(products.ToArray(), scene.FromUserName, scene.ToUserName);
             return response;
@@ -589,24 +916,51 @@ namespace DBC.WeChat.Services.Conversation.Components
             return response;
         }
 
+        /// <summary>
+        /// 发送客服消息
+        /// </summary>
+        /// <param name="token"></param>
+        /// <param name="response"></param>
+        public void CustomerServiceResponse(string token, ResponseMSG response)
+        {
+            var uri = new Uri(string.Format(Res.CustomerServiceURL, token));
+            var data = WebClientPostJson(uri, JsonConvert.SerializeObject(response));
+            Logger.SafeLog(data,Level.Info);
+            var obj = (EventResponse)JsonConvert.DeserializeObject(data, typeof(EventResponse));
+            if (obj.Errcode != "0")
+            {
+                string error = string.Format("Touser:{0}---errorcode:{1}---errormsg:{2}", response.ToUserName, obj.Errcode, obj.Errmsg);
+                Logger.SafeLog(error, Level.Error);
+            }
+        }
+
+        private string WebClientPostJson(Uri uri, string data)
+        {
+            WebClient client = new WebClient();
+            client.Encoding = System.Text.Encoding.UTF8;
+            client.Headers.Add(HttpRequestHeader.Accept, "json");
+            client.Headers.Add(HttpRequestHeader.ContentType, "application/x-www-form-urlencoded; charset=UTF-8");
+            return client.UploadString(uri, "POST", data);
+        }
+
         private string GetSubscribeOrNotResponse(long ownerID, string toUser, string fromUser, bool subscribe)
         {
             string response = "";
             int type = subscribe ? (int)RuleType.Subscribe : (int)RuleType.UnSubscribe;
-            var rule = ModelService.SelectOrEmpty(new KeyWordGroupQuery() { OwnerID = ownerID, Type = type }).FirstOrDefault();
+            var rule = ModelService.SelectOrEmpty(new RuleQuery() { OwnerID = ownerID, Type = type }).FirstOrDefault();
             if (rule == null)
                 return response;
-            var reply = ModelService.SelectOrEmpty(new ReplyQuery() { OwnerID = ownerID, KeyWordGroupID = rule.ID }).FirstOrDefault();
+            var reply = ModelService.SelectOrEmpty(new ReplyQuery() { OwnerID = ownerID, RuleID = rule.ID }).FirstOrDefault();
             if (reply == null)
                 return response;
             switch (reply.Type)
             {
-                case (int)ReplyType.text:
+                case (int)ReplyType.Text:
                     var textreply = ModelService.SelectOrEmpty(new TextReplyItemQuery() { ParentID = reply.ID, OwnerID = ownerID }).FirstOrDefault();
                     if (textreply != null)
                         response = MakeTextResponse(textreply, toUser, fromUser);
                     break;
-                case (int)ReplyType.news:
+                case (int)ReplyType.News:
                     break;
             }
             return response;
